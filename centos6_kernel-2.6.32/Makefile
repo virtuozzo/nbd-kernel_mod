@@ -13,7 +13,7 @@ MODDIR := /lib/modules/$(KERNEL_VERSION)/kernel/drivers/block/
 #DMOBJS = nbd.o
 KMODNAME = nbd
 
-TESTS= nbd_print_debug nbd_set_timeout nbd_conn_info nbd_server_cmd
+TESTS= qhash_test nbd_print_debug nbd_set_timeout nbd_conn_info nbd_server_cmd
 
 obj-m += $(KMODNAME).o
 #nbd-objs += $(DMOBJS)
@@ -33,6 +33,7 @@ all: nbd_mod $(TESTS)
 nbd_mod:
 	$(MAKE) -C $(KERNELDIR) M=$(PWD) modules
 
+qhash_test.o: qhash_test.c nbd.h
 nbd_print_debug.o: nbd_print_debug.c nbd.h
 nbd_set_timeout.o: nbd_set_timeout.c nbd.h
 nbd_conn_info.o: nbd_conn_info.c nbd.h
@@ -56,7 +57,7 @@ install:
 	install -m 755 nbd_server_cmd /usr/bin
 
 clean:
-	\rm -rf *.o .*.o.d .depend *.ko .*.cmd *.mod.c .tmp* Module.markers Module.symvers modules.order *.ko.unsigned
+	\rm -rf *.o .*.o.d .depend *.ko .*.cmd *.mod.c .tmp* Module.markers Module.symvers modules.order
 	\rm -f types.vim tags $(TESTS)
 
 wc:

@@ -13,7 +13,7 @@ MODDIR := /lib/modules/$(KERNEL_VERSION)/kernel/drivers/block/
 #DMOBJS = nbd.o
 KMODNAME = nbd
 
-TESTS= nbd_print_debug
+TESTS= qhash_test nbd_print_debug
 
 obj-m += $(KMODNAME).o
 #nbd-objs += $(DMOBJS)
@@ -33,6 +33,7 @@ all: nbd_mod $(TESTS)
 nbd_mod:
 	$(MAKE) -C $(KERNELDIR) M=$(PWD) modules
 
+qhash_test.o: qhash_test.c nbd.h
 nbd_print_debug.o: nbd_print_debug.c nbd.h
 
 ins:

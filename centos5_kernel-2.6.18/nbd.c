@@ -13,8 +13,6 @@
  *
  * 2012/04/09 Michail Flouris <michail.flouris@onapp.com>
  *            Added query hash ioctl command and several bug fixes
- * 2012/06/27 Michail Flouris <michail.flouris@onapp.com>
- *            Added rolling timeout of requests killing hanging connections
  * 2013/02/25 Michail Flouris <michail.flouris@onapp.com>
  *            Added conn_info ioctl command code
  * 2013/10/10 Michail Flouris <michail.flouris@onapp.com>

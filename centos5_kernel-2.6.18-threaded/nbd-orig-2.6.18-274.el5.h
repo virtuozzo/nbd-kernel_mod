@@ -26,24 +26,46 @@
 #define NBD_DISCONNECT  _IO( 0xab, 8 )
 #define NBD_QUERY_HASH	_IO( 0xab, 12 )
 
-/* enum {
+enum {
 	NBD_CMD_READ = 0,
 	NBD_CMD_WRITE = 1,
 	NBD_CMD_DISC = 2
-};*/
-enum nbd_command {
-    NBD_CMD_READ = 0,
-    NBD_CMD_WRITE = 1,
-    NBD_CMD_DISC = 2,
-    NBD_CMD_FLUSH = 3,
-    NBD_CMD_TRIM = 4,
-    NBD_CMD_QHASH = 5
 };
 
 #define nbd_cmd(req) ((req)->cmd[0])
 #define MAX_NBD 128
 
 /* userspace doesn't need the nbd_device structure */
+#ifdef __KERNEL__
+
+#include <linux/wait.h>
+#include <linux/mutex.h>
+
+/* values for flags field */
+#define NBD_READ_ONLY 0x0001
+#define NBD_WRITE_NOCHK 0x0002
+
+struct request;
+
+struct nbd_device {
+	int flags;
+	int harderror;		/* Code of hard error			*/
+	struct socket * sock;
+	struct file * file; 	/* If == NULL, device is not ready, yet	*/
+	int magic;
+
+	spinlock_t queue_lock;
+	struct list_head queue_head;/* Requests are added here...	*/
+	struct request *active_req;
+	wait_queue_head_t active_wq;
+
+	struct mutex tx_lock;
+	struct gendisk *disk;
+	int blksize;
+	u64 bytesize;
+};
+
+#endif
 
 /* These are sent over the network in the request/reply magic fields */
 

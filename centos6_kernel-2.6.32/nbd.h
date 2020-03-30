@@ -54,8 +54,7 @@ enum nbd_command {
     NBD_CMD_FLUSH = 3,
     NBD_CMD_TRIM = 4,
     NBD_CMD_QHASH = 5,
-    NBD_CMD_SRVCMD = 6,
-    NBD_CMD_QHASHB = 7
+    NBD_CMD_SRVCMD = 6
 };
 
 #define nbd_cmd(req) ((req)->cmd[0])

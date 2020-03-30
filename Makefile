@@ -1,10 +1,7 @@
 #
-# Makefile for the extended nbd driver
-#
-# Copyright (C) 2011-2016 OnApp Ltd.
-# Author: Michail Flouris <michail.flouris@onapp.com>
+# Author: (C) 2012 Michail Flouris <michail.flouris@onapp.com>
 
-# Add debugging??
+# Add heavy debugging??
 #DFLAGS = -g -g3 -ggdb
 #EXTRA_CFLAGS += $(DFLAGS)
 
@@ -32,10 +29,6 @@ KERNEL_VERSION ?= $(shell uname -r)
 KERN_MAJOR_VER := $(shell echo '$(KERNEL_VERSION)' | cut -d '.' -f 1)
 KERN_MINOR_VER := $(shell echo '$(KERNEL_VERSION)' | cut -d '.' -f 2)
 
-MIN_VER_12 := $(shell echo '$(KERN_MINOR_VER) >= 1 && $(KERN_MINOR_VER) <= 2' | bc )
-MIN_VER_34 := $(shell echo '$(KERN_MINOR_VER) >= 3 && $(KERN_MINOR_VER) <= 4' | bc )
-MIN_VER_512 := $(shell echo '$(KERN_MINOR_VER) >= 5 && $(KERN_MINOR_VER) <= 12' | bc )
-
 # 0 or 1 if we compile on 64-bit architecture
 IS_64_ARCH := $(shell uname -m | grep 64 | wc -l )
 
@@ -43,14 +36,7 @@ IS_64_ARCH := $(shell uname -m | grep 64 | wc -l )
 BUILDDIR :=
 
 ifeq ($(LINUX_TYPE),Redhat)
-
-CENTOS_REL_STRING := $(shell cat /etc/redhat-release | grep 'CentOS Linux' )
-ifeq ($(CENTOS_REL_STRING),)
-# try the older Centos string version
 CENTOS_VERSION := $(shell cat /etc/redhat-release | grep 'CentOS' | cut -c 16 )
-else
-CENTOS_VERSION := $(shell cat /etc/redhat-release | grep 'CentOS Linux' | cut -c 22 )
-endif
 
 # Check which version of centos to build on... 
 ifeq ($(CENTOS_VERSION),)
@@ -60,18 +46,9 @@ ifeq ($(CENTOS_VERSION),5)
 	BUILDDIR := "centos5_kernel-2.6.18"
 	#BUILDDIR := "centos5_kernel-2.6.18-threaded"
 endif
-ifeq ($(CENTOS_VERSION),$(filter $(CENTOS_VERSION),6 7))
+ifeq ($(CENTOS_VERSION),6)
 	ifeq ($(KERN_MAJOR_VER),3)
-		BUILDDIR := "linux-kernel-3.13"
-		ifeq ($(MIN_VER_12),1)
-			BUILDDIR := "linux-kernel-3.1.5"
-		endif
-		ifeq ($(MIN_VER_34),1)
-			BUILDDIR := "linux-kernel-3.4.6"
-		endif
-		ifeq ($(MIN_VER_512),1)
-			BUILDDIR := "linux-kernel-3.8"
-		endif
+		BUILDDIR := "linux-kernel-3.8"
 	else
 		BUILDDIR := "centos6_kernel-2.6.32"
 	endif
@@ -80,16 +57,14 @@ else
 	# we go by kernel version number in here...
 	ifeq ($(LINUX_TYPE),Ubuntu)
 		ifeq ($(KERN_MAJOR_VER),3)
+			MIN_VER_12 := $(shell echo '$(KERN_MINOR_VER) >= 1 && $(KERN_MINOR_VER) <= 2' | bc )
+			MIN_VER_34 := $(shell echo '$(KERN_MINOR_VER) >= 3 && $(KERN_MINOR_VER) <= 4' | bc )
 			ifeq ($(MIN_VER_12),1)
 				BUILDDIR := "linux-kernel-3.1.5"
-			endif
+			else
 			ifeq ($(MIN_VER_34),1)
 				BUILDDIR := "linux-kernel-3.4.6"
 			endif
-			ifeq ($(MIN_VER_512),1)
-				BUILDDIR := "linux-kernel-3.8"
-			else
-				BUILDDIR ?= "linux-kernel-3.13"
 			endif
 		else
 			BUILDDIR := $(error Ubuntu Kernel version < 3! Change into a 2.x kernel version subdir and 'make' in there!)
@@ -104,7 +79,7 @@ ifeq ($(BUILDDIR),)
 	BUILDDIR := $(error NBD built not supported on current distro/kernel version! Aborting!)
 endif
 
-BINS= nbd_print_debug
+BINS= qhash_test nbd_print_debug
 
 .PHONY: all ins lsm rmm test install clean wc
 all:

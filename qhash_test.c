@@ -22,7 +22,6 @@
  * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -44,18 +43,38 @@
 
 #include "nbd.h"
 
+static const char hexdigits[] = {'0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f'};
+
 /* ____________________________________________________________________________
- * Sends the NBD_PRINT_DEBUG ioctl to the NBD device (already opened)...
+ * Sends the hash_query ioctl to the NBD device (already opened)...
+ * @param blkaddr:  starting block address requested
+ * @param blksize:  block size in bytes requested
+ * @param blkcount: number of block hashes requested (<= MAX_QUERY_BLKS)
+ *
+ * @return nbd_query_blkhash_t with the requested bitmap & hashes
  */
+
 int
-nbd_print_debug_ioctl( int devfd )
+nbd_query_hash_ioctl( int devfd, uint64_t blkaddr, int blksize,
+						uint16_t blkcount, nbd_query_blkhash_t *nqb )
 {
-	if ( ioctl(devfd, NBD_PRINT_DEBUG ) < 0 ) {
-		perror("Sending NBD_PRINT_DEBUG ioctl():");
+	/* prepare the request values for the ioctl... */
+	memset( nqb, 0, sizeof(nbd_query_blkhash_t) );
+	nqb->blkaddr = blkaddr;
+	nqb->blksize = blksize;
+	nqb->blkcount = blkcount;
+
+	nqb->hash_type = G_CHECKSUM_SHA256;
+	nqb->hash_len = 32;
+
+	printf("Sending IOCTL: fd=%d, ioctl: %lx nqb: %lx\n", devfd, (unsigned long)NBD_QUERY_HASH, (unsigned long)nqb );
+
+	if ( ioctl(devfd, NBD_QUERY_HASH, nqb ) < 0 ) {
+		perror("Sending NBD_QUERY_HASH ioctl():");
 		return 0;
 	} 
 
-	printf("NBD_PRINT_DEBUG successful!");
+	printf("QUERY_HASH successful!");
 	return 1;
 }
 
@@ -63,12 +82,21 @@ nbd_print_debug_ioctl( int devfd )
 int
 main(int argc, char ** argv)
 {
-	int devfd;
+	uint64_t blkaddr = 0;
+	nbd_query_blkhash_t nqb;
+	unsigned char t;
+	int devfd, i;
 
-	if (argc != 2) {
-		fprintf( stderr, "\"%s\": Send a print_debug cmd to nbd\n", argv[0]);
-		fprintf( stderr, "Usage: %s <nbd device>\n", argv[0]);
+	if (argc != 3) {
+		fprintf( stderr, "\"%s\": Send a query_hash cmd to nbd\n", argv[0]);
+		fprintf( stderr, "Usage: %s <nbd device> <block number>\n", argv[0]);
 		exit(1);
+	}
+
+	blkaddr = atoi(argv[2]);
+	if (blkaddr < 0 || blkaddr > 1024*1024*1024 ) {
+        fprintf( stderr, "Error: Invalid block address: %llu\n", blkaddr);
+        return 0;
 	}
 
         /* Open the device driver descriptor ... */
@@ -77,10 +105,18 @@ main(int argc, char ** argv)
         return 0;
     }
 
-	if ( nbd_print_debug_ioctl( devfd ) ) {
-		printf("NBD_PRINT_DEBUG: Successful.\n");
+	if ( nbd_query_hash_ioctl( devfd, blkaddr, 64*1024 /* blksize */, 1 /*blkcount*/, &nqb ) ) {
+
+		printf("VALID BITMAP: 0x%llx HASH= ", nqb.blkmap );
+		for (i = 0; i < nqb.hash_len; i++) {
+			t = nqb.blkhash[0][i];
+			printf( "%c%c",	hexdigits[(t >> 4) & 0xf], hexdigits[t & 0xf] );
+		}
+		printf("\n");
+
+		printf("Query Hash [Blk: %llu]: Successful.\n", blkaddr );
 	} else
-		printf("NBD_PRINT_DEBUG: Failed.\n");
+		printf("Query Hash [Blk: %llu]: Failed.\n", blkaddr );
 
 	return 0;
 
