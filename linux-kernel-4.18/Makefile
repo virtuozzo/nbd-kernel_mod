@@ -1,5 +1,5 @@
 #
-# Author: (C) 2012 Michail Flouris <michail.flouris@onapp.com>
+# Author: (C) 2018 Michail Flouris <michail.flouris@onapp.com>
 
 # Add heavy debugging??
 #DFLAGS = -g -g3 -ggdb
@@ -26,6 +26,16 @@ ifeq ($(KERNELRELEASE),)
 
 default: all
 endif
+
+# Need special flags for Centos7 (el7) patchset 328 onwards, kernel code is different from el6
+KERN_RH_PATCHSET := $(shell echo '$(KERNEL_VERSION)' | cut -d '-' -f 2 | cut -d '.' -f 1)
+#RHP_MIN_VER_328 := $(shell echo '$(KERN_RH_PATCHSET) >= 328 ' | bc )
+#
+#ifeq ($(shell echo '$(KERNEL_VERSION)' | grep el7 | wc -l), 1)
+#	ifeq ($(shell echo '$(RHP_MIN_VER_328)'), 1)
+#		EXTRA_CFLAGS += -DEL7_VER_328
+#	endif
+#endif
 
 .PHONY: all nbd_mod ins lsm rmm install clean wc
 all: nbd_mod $(TESTS)

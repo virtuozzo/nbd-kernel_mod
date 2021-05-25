@@ -315,6 +315,49 @@ static void nbd_end_request(struct request *req)
 	spin_unlock_irqrestore(q->queue_lock, flags);
 }
 
+#define SHUTDOWN_UNLOCK_TIMEOUT_SEC	20
+
+static void nbd_unlock_timeout(unsigned long arg)
+{
+	struct nbd_device *nbd = (struct nbd_device *)arg;
+
+	if ( mutex_is_locked(&nbd->tx_lock) ) {
+		printk(KERN_ERR "%s: nbd_unlock_timeout() UNLOCKING tx_lock after %d seconds!\n",
+					nbd->disk->disk_name, SHUTDOWN_UNLOCK_TIMEOUT_SEC );
+		mutex_unlock(&nbd->tx_lock);
+	}
+}
+
+static void
+lock_auto_unlockable_mutex(struct nbd_device *nbd, const char *funcname)
+{
+	struct timer_list uti;
+	int unlock_timer_enabled = 0;
+
+	/* if lock is already locked, WARN of the upcoming deadlock and
+	 * unlock it by force within SHUTDOWN_UNLOCK_TIMEOUT_SEC seconds! */
+	if ( mutex_is_locked(&nbd->tx_lock) ) {
+
+		printk(KERN_ERR "%s: %s() WARNING: LOCKED tx_lock, will auto unlock in %d sec!\n",
+				nbd->disk->disk_name, funcname, SHUTDOWN_UNLOCK_TIMEOUT_SEC );
+
+		init_timer(&uti);
+		uti.function = nbd_unlock_timeout;
+		uti.data = (unsigned long)nbd;
+		uti.expires = jiffies + (SHUTDOWN_UNLOCK_TIMEOUT_SEC * HZ);
+		add_timer(&uti);
+
+		unlock_timer_enabled = 1; /* timer enabled */
+	}
+
+	mutex_lock(&nbd->tx_lock); /* ok, now lock it... */
+
+	if ( unlock_timer_enabled ) { /* did we have to set the timer? if yes, then disable it! */
+
+		del_timer(&uti); /* this works in inactive timers too... */
+	}
+}
+
 static void sock_shutdown(struct nbd_device *nbd, int lock)
 {
 	/* Forcibly shutdown the socket causing all listeners
@@ -324,7 +367,7 @@ static void sock_shutdown(struct nbd_device *nbd, int lock)
 	 * there should be a more generic interface rather than
 	 * calling socket ops directly here */
 	if (lock)
-		mutex_lock(&nbd->tx_lock);
+		lock_auto_unlockable_mutex(nbd, "sock_shutdown");
 
 	if (nbd->sock) {
 #ifdef ENABLE_REQ_DEBUG
@@ -525,10 +568,8 @@ static int sock_xmit(struct nbd_device *nbd, int send, void *buf, int size,
 				dequeue_signal_lock(current, &current->blocked, &info),
 				mutex_is_locked(&nbd->tx_lock), send );
 			result = -EINTR;
-			sock_shutdown(nbd, !send && !mutex_is_locked(&nbd->tx_lock) );
-			// IMPORTANT: need the following unlock to unblock ioctls which have aquired it!
-			if ( !send && mutex_is_locked(&nbd->tx_lock) )
-				mutex_unlock(&nbd->tx_lock);
+			/* NOTE: sock_shutdown has auto-unlockable tx_lock (via timeout) */
+			sock_shutdown(nbd, !send);
 			printk(KERN_WARNING "%s: (pid %d: %s) socket shut down OK... lock: %d\n",
 				nbd->disk->disk_name, task_pid_nr(current), current->comm,
 				mutex_is_locked(&nbd->tx_lock) );
@@ -2066,6 +2107,10 @@ srvcmd_exit:
 		error = nbd_do_it(nbd);
 		kthread_stop(thread);
 
+		/* Michail, 16Aug2017: removed this message, as it's no longer useful, only fills the syslog... */
+		//if ( mutex_is_locked(&nbd->tx_lock) ) /* WARN of the upcoming deadlock! */
+		//	printk(KERN_ERR "%s: WARNING: LOCKED tx_lock! deadlock coming up?\n", nbd->disk->disk_name );
+
 		mutex_lock(&nbd->tx_lock);
 		printk(KERN_ERR "%s: EXITING: stopped kthread, got tx_lock...\n", nbd->disk->disk_name );
 		if (error)
@@ -2216,7 +2261,17 @@ static int nbd_ioctl(struct block_device *bdev, fmode_t mode,
 	dprintk(DBG_IOCTL, "%s: nbd_ioctl cmd=%s(0x%x) arg=%lu\n",
 		nbd->disk->disk_name, ioctl_cmd_to_ascii(cmd), cmd, arg);
 
-	mutex_lock(&nbd->tx_lock);
+	switch (cmd) { /* on some cmds we auto-unlock... */
+	case NBD_DISCONNECT:
+	case NBD_CLEAR_SOCK:
+	case NBD_CLEAR_QUE:
+		lock_auto_unlockable_mutex(nbd, "nbd_ioctl");
+	break;
+	default:
+		mutex_lock(&nbd->tx_lock);
+	break;
+	}
+
 	error = __nbd_ioctl(bdev, nbd, cmd, arg);
 	mutex_unlock(&nbd->tx_lock);
 

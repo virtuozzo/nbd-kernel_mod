@@ -10,7 +10,7 @@
  *            Cleanup PARANOIA usage & code.
  * 2004/02/19 Paul Clements
  *            Removed PARANOIA, plus various cleanup and comments
- * 2012/04/09 Michail Flouris <michail.flouris@onapp.com>
+ * 2013/02/12 Michail Flouris <michail.flouris@onapp.com>
  *            Added query hash ioctl command
  * 2013/02/25 Michail Flouris <michail.flouris@onapp.com>
  *            Added conn_info ioctl command
@@ -18,8 +18,8 @@
  *            Added server_cmd ioctl command
  */
 
-#ifndef LINUX_NBD_H
-#define LINUX_NBD_H
+#ifndef _UAPILINUX_NBD_H
+#define _UAPILINUX_NBD_H
 
 #include <linux/types.h>
 
@@ -37,10 +37,12 @@
 #define NBD_QUERY_HASH	_IOWR( 0xab, 12, nbd_query_blkhash_t )
 #define NBD_CONN_INFO	_IOWR( 0xab, 13, nbd_conn_info_t )
 #define NBD_SERVER_CMD	_IOWR( 0xab, 14, nbd_server_cmd_t )
+#define NBD_QUERY_HASHB	_IOWR( 0xab, 15, nbd_query_blkhashbat_t )
 
 
 /* define to enable counters (mostly for debugging & tracing...) */
-#define ENABLE_REQ_DEBUG
+#undef ENABLE_REQ_DEBUG
+#define NDEBUG
 
 /* enum {
 	NBD_CMD_READ = 0,
@@ -57,6 +59,16 @@ enum nbd_command {
     NBD_CMD_SRVCMD = 6,
     NBD_CMD_QHASHB = 7
 };
+
+/* values for flags field */
+#define NBD_FLAG_HAS_FLAGS    (1 << 0) /* nbd-server supports flags */
+#define NBD_FLAG_READ_ONLY    (1 << 1) /* device is read-only */
+/* there is a gap here to match userspace */
+#define NBD_FLAG_SEND_FLUSH     (1 << 2)        /* Send FLUSH */
+#define NBD_FLAG_SEND_FUA       (1 << 3)        /* Send FUA (Force Unit Access) */
+#define NBD_FLAG_ROTATIONAL     (1 << 4)        /* Use elevator algorithm - rotational media */
+
+#define NBD_FLAG_SEND_TRIM    (1 << 5) /* send trim/discard */
 
 #define nbd_cmd(req) ((req)->cmd[0])
 
@@ -83,25 +95,21 @@ typedef struct nbd_server_cmd_ {
 #include <linux/wait.h>
 #include <linux/mutex.h>
 
-#define assert(x) if (unlikely(!(x))) { printk( KERN_ALERT " *** ASSERT: %s failed @ %s(): line %d\n", \
+#define assert(x) if (unlikely(!(x))) { printk( KERN_ALERT "ASSERT: %s failed @ %s(): line %d\n", \
                                                 #x, __FUNCTION__,__LINE__); }
-#define bug_return(x,r) if (unlikely(x)) { printk( KERN_ALERT " *** BUG DETECTED: %s failed @ %s(): line %d\n", \
+#define bug_return(x,r) if (unlikely(x)) { printk( KERN_ALERT "BUG DETECTED: %s failed @ %s(): line %d\n", \
                                                 #x, __FUNCTION__,__LINE__); return r; }
-
-#define debug_msg(x) printk( KERN_ALERT "DEBUG: %s @ %s(): line %d\n", #x, __FUNCTION__,__LINE__);
 
 /* values for flags field */
 #define NBD_READ_ONLY 0x0001
 #define NBD_WRITE_NOCHK 0x0002
-
-#define NBD_FLAG_SEND_FLUSH     (1 << 2)        /* Send FLUSH */
 
 /* max sectors (pages) for io requests in the nbd queues (i.e. req split limit) */
 #define MAX_BIO_PAGES	128
 #define PAGE_SECTORS	(PAGE_SIZE >> 9)
 
 /* ATTENTION: this includes a comma-separated list of 2 chars per feature supported by this nbd... */
-#define NBD_FEATURE_SET "TO,PD,QH,SC,FL,"
+#define NBD_FEATURE_SET "TO,TR,PD,QH,QB,SC,FL,"
 /* LIST OF FEATURES SUPPORTED AND MEANINGS:
  * TO: NBD Timeouts
  * TR: TRIM feature
@@ -121,12 +129,12 @@ struct nbd_device {
 	struct file * file; 	/* If == NULL, device is not ready, yet	*/
 	int magic;
 
-	spinlock_t queue_lock;
-	struct list_head queue_head;	/* Requests waiting result */
-	struct request *active_req;
-	wait_queue_head_t active_wq;
+	spinlock_t lock;
+	spinlock_t blk_queue_lock;
 	struct list_head waiting_queue;	/* Requests to be sent */
 	wait_queue_head_t waiting_wq;
+	spinlock_t queue_lock;
+	struct list_head queue_head;	/* Requests waiting result */
 
 	struct mutex tx_lock;
 	struct gendisk *disk;
@@ -136,7 +144,6 @@ struct nbd_device {
 	spinlock_t timer_lock;
 	atomic_t reqs_in_progress;
 	volatile int xmit_timeout;
-	int errmsg_last_time;
 	struct task_struct *client_task;
 	struct timer_list ti;
 
@@ -163,6 +170,9 @@ struct nbd_device {
 	atomic_t req_inprogr_wr;
 #endif
 	nbd_conn_info_t conn_info; /* stored connection info */
+#if IS_ENABLED(CONFIG_DEBUG_FS)
+	struct dentry *dbg_dir;
+#endif
 };
 
 #endif
@@ -184,11 +194,7 @@ struct nbd_request {
 	char handle[8];
 	__be64 from;
 	__be32 len;
-}
-#ifdef __GNUC__
-	__attribute__ ((packed))
-#endif
-;
+} __attribute__((packed));
 
 /*
  * This is the reply packet that nbd-server sends back to the client after
@@ -209,9 +215,10 @@ struct nbd_reply {
  *       both master and slave hashes are updated continuously! Thus caching hashes on the master
  *       leads to comparison of stale hashes and incorrect resync of data blocks!
  *
- * CAUTION: this value MUST be defined identical to the one in nbd.h for the ioctl handler!
+ * CAUTION: these values MUST be defined identical to the ones in nbd.h for the ioctl handler!
  */
-#define	MAX_QUERY_BLKS	1	/* must be <= 64 */
+#define	MAX_QUERY_BLKS			1	/* must be 1 for backwards compatibility!! */
+#define	MAX_QUERY_BLKS_BATCH	64	/* must be 64 */
 
 /* CAUTION: this MUST be greater or equal to BLOCK_HASH_SIZE (in nbd_storage.h) */
 #define	MAX_HASH_LEN	32	/* max byte length of hash values */
@@ -227,7 +234,7 @@ typedef enum {
 typedef struct nbd_qhash_request_t_ {
 	uint64_t	blkaddr;	/* starting block address */
 	uint32_t	blksize;	/* block size in bytes */
-	uint16_t	blkcount;	/* number of block hashes returned (<= MAX_QUERY_BLKS) */
+	uint16_t	blkcount;	/* number of block hashes returned (<= MAX_QUERY_BLKS_BATCH) */
 	uint16_t	hash_type;	/* type of hash algorithm (encoded value) */
 	uint32_t	hash_len;	/* number of bytes per hash (<= MAX_HASH_LEN) */
 } __attribute__((packed)) nbd_qhash_request_t;
@@ -246,4 +253,17 @@ typedef struct nbd_query_blkhash_t_ {
 	uint64_t	blkmap;		/* bitmap with 1s for valid data blocks */
 	char		blkhash[MAX_QUERY_BLKS][MAX_HASH_LEN];	/* byte array with block hash */
 } __attribute__((packed)) nbd_query_blkhash_t;
-#endif
+
+/* Clone of nbd_query_blkhash_t to maintain backwards compatibility with older nbds
+ * that support only single-hash ioctl and message type */
+typedef struct nbd_query_blkhashbat_t_ {
+	uint64_t	blkaddr;	/* starting block address */
+	uint32_t	blksize;	/* block size in bytes */
+	uint16_t	blkcount;	/* number of block hashes returned (<= MAX_QUERY_BLKS_BATCH) */
+	uint16_t	hash_type;	/* type of hash algorithm (encoded value) */
+	uint32_t	hash_len;	/* number of bytes per hash (<= MAX_HASH_LEN) */
+	uint32_t	error;		/* error code for request */
+	uint64_t	blkmap;		/* bitmap with 1s for valid data blocks */
+	char		blkhash[MAX_QUERY_BLKS_BATCH][MAX_HASH_LEN];	/* byte array with block hash */
+} __attribute__((packed)) nbd_query_blkhashbat_t;
+#endif /* _UAPILINUX_NBD_H */

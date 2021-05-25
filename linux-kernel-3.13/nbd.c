@@ -12,7 +12,6 @@
  * (part of code stolen from loop.c)
  *
  * 2013/02/12 Michail Flouris <michail.flouris@onapp.com>
- *            Ported code from previous kernel versions
  *            Added query hash ioctl command and several bug fixes
  * 2013/02/25 Michail Flouris <michail.flouris@onapp.com>
  *            Added conn_info ioctl command code
@@ -400,6 +399,20 @@ void nbd_xmit_timeout(unsigned long arg)
 void nbd_resp_timeout(unsigned long arg)
 {
 	struct nbd_device *nbd = (struct nbd_device *)arg;
+
+    if (atomic_read(&nbd->qhash_pending) > 0 && &nbd->qhash_wait) {
+        printk(KERN_ALERT "%s: clearing pending qhash req due timeout\n", nbd->disk->disk_name);
+        nbd->qhash_req->errors++;
+        complete_all(&nbd->qhash_wait);
+        return;
+    }
+
+    if ( atomic_read(&nbd->srvcmd_pending) > 0 && &nbd->srvcmd_wait) {
+        printk(KERN_ALERT "%s: clearing pending srvcmd req due timeout\n", nbd->disk->disk_name);
+        nbd->srvcmd_req->errors++;
+        complete_all(&nbd->srvcmd_wait);
+        return;
+    }
 
 	/* CAUTION: directly shutting down the socket causes a mini kernel panic...
 	 *          -> so try to kill the client process with SIGKILL... */
@@ -799,6 +812,7 @@ static struct request *nbd_read_stat(struct nbd_device *nbd)
 	struct nbd_reply reply;
 	struct request *req;
 
+    reply.error = 0;
 	reply.magic = 0;
 	result = sock_xmit(nbd, 0, &reply, sizeof(reply), MSG_WAITALL);
 	if (result <= 0) {
@@ -823,11 +837,14 @@ static struct request *nbd_read_stat(struct nbd_device *nbd)
 #endif
 
 	if (ntohl(reply.magic) != NBD_REPLY_MAGIC) {
-		dev_err(disk_to_dev(nbd->disk), "Wrong magic (0x%lx)\n",
-				(unsigned long)ntohl(reply.magic));
-		result = -EPROTO;
-		goto harderror;
-	}
+        dev_err(disk_to_dev(nbd->disk), "Wrong magic (0x%lx)\n", (unsigned long)ntohl(reply.magic));
+        goto networkerror;
+    }
+
+    if (ntohl(reply.error)) {
+        dev_err(disk_to_dev(nbd->disk), "Other side returned error (%d)\n", (int)ntohl(reply.error));
+        goto networkerror;
+    }
 
 	if ( atomic_read(&nbd->qhash_pending) > 0 ) { /* pending qhash reqs? */
 		struct request *qreq;
@@ -1075,18 +1092,8 @@ static struct request *nbd_read_stat(struct nbd_device *nbd)
 		if (result != -ENOENT)
 			goto harderror;
 
-		dev_err(disk_to_dev(nbd->disk), "Unexpected reply (%p)\n",
-			reply.handle);
-		result = -EBADR;
-		goto harderror;
-	}
-
-	if (ntohl(reply.error)) {
-		dev_err(disk_to_dev(nbd->disk), "Other side returned error (%d)\n",
-			ntohl(reply.error));
-		dump_last_requests(nbd);
-		req->errors++;
-		return req;
+        dev_err(disk_to_dev(nbd->disk), "Unexpected reply (%p)\n", reply.handle);
+        goto networkerror;
 	}
 
 	dprintk(DBG_RX, "%s: request %p: got reply\n",
@@ -1115,6 +1122,14 @@ static struct request *nbd_read_stat(struct nbd_device *nbd)
 		}
 	}
 	return req;
+
+networkerror:
+    if (! nbd->errmsg_last_time || jiffies >= nbd->errmsg_last_time + (5*HZ))
+        nbd->errmsg_last_time = jiffies;
+
+    //return fake pointer and error to avoid end of read loop
+    nbd->harderror = -EPROTO;
+    return (struct request *)0x1;
 
 harderror:
 	dump_last_requests(nbd);
@@ -1179,6 +1194,11 @@ static int nbd_do_it(struct nbd_device *nbd)
 	}
 
 	while ((req = nbd_read_stat(nbd)) != NULL) {
+        if (nbd->harderror == -EPROTO) {
+            //Ignore Network errors
+            nbd->harderror = 0;
+            continue;
+        }
 		if (req->cmd_type == REQ_TYPE_SPECIAL &&
 			( nbd_cmd(req) == NBD_CMD_QHASH || nbd_cmd(req) == NBD_CMD_SRVCMD ||
 			  /*nbd_cmd(req) == NBD_CMD_FLUSH || */ nbd_cmd(req) == NBD_CMD_QHASHB ) ) { /* qhash or srvcmd req? */
@@ -1679,8 +1699,10 @@ qcompl_wait:
 
 		/* Flag error, if not set already */
 		if (qreq->errors) {
-			retval = -EINVAL;
-
+             if ( atomic_read(&nbd->qhash_pending) > 0 ) {
+                atomic_dec(&nbd->qhash_pending);
+            }
+            retval = -EINVAL;
 		} else if (copy_to_user( (nbd_query_blkhash_t *)arg, (char *)nbd_qhash, sizeof(nbd_query_blkhash_t))) {
 			/* Return hash data back to user... */
 			printk( KERN_ERR "ERROR: Copying query_hash ioctl() data to user space\n");
@@ -1791,10 +1813,12 @@ qbcompl_wait:
 
 		dprintk(DBG_QHASH, "%s QHash_Bat COMPLETED: blkmap= 0x%llx!\n", nbd->disk->disk_name, nbd_qhashb->blkmap );
 
-		/* Flag error, if not set already */
 		if (qreq->errors) {
-			retval = -EINVAL;
-
+            // return error to IOCTL if request timed out or returned with errors and stop waiting for response
+            retval = -EINVAL;
+            if ( atomic_read(&nbd->qhash_pending) > 0 ) {
+                atomic_dec(&nbd->qhash_pending);
+            }
 		} else if (copy_to_user( (nbd_query_blkhashbat_t *)arg, (char *)nbd_qhashb, sizeof(nbd_query_blkhashbat_t))) {
 			/* Return hash data back to user... */
 			printk( KERN_ERR "ERROR: Copying query_hashb ioctl() data to user space\n");
@@ -2011,6 +2035,8 @@ scompl_wait:
 				nbd_srvcmd->err_code = 1;
 				sprintf( nbd_srvcmd->cmdbytes, "ERROR: nbd connection error");
 				retval = -EINVAL;
+                if ( atomic_read(&nbd->srvcmd_pending) > 0 ) /* pending srvcmd reqs? */
+                    atomic_dec( &nbd->srvcmd_pending );
 			}
 
 			nbd_srvcmd->connected = nbd->sock ? 1 : 0; /* still connected? */
@@ -2135,8 +2161,9 @@ srvcmd_exit:
 		error = nbd_do_it(nbd);
 		kthread_stop(thread);
 
-		if ( mutex_is_locked(&nbd->tx_lock) ) /* WARN of the upcoming deadlock! */
-			printk(KERN_ERR "%s: WARNING: LOCKED tx_lock! deadlock coming up?\n", nbd->disk->disk_name );
+		/* Michail, 16Aug2017: removed this message, as it's no longer useful, only fills the syslog... */
+		//if ( mutex_is_locked(&nbd->tx_lock) ) /* WARN of the upcoming deadlock! */
+		//	printk(KERN_ERR "%s: WARNING: LOCKED tx_lock! deadlock coming up?\n", nbd->disk->disk_name );
 
 		mutex_lock(&nbd->tx_lock);
 		printk(KERN_ERR "%s: EXITING: stopped kthread, got tx_lock...\n", nbd->disk->disk_name );

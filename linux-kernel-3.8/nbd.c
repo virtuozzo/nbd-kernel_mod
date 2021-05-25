@@ -78,6 +78,12 @@ static char __nbd_build_date[NBD_BUILD_STR_MAXLEN] = __DATE__" "__TIME__; // sto
 #define INIT_COMPLETION(x) reinit_completion(&x)
 #endif
 
+#ifdef EL7_VER_328
+#define DEP_REQ_TYPE_SPECIAL	REQ_TYPE_DRV_PRIV
+#else
+#define DEP_REQ_TYPE_SPECIAL	REQ_TYPE_SPECIAL
+#endif
+
 /*
  * Use just one lock (or at most 1 per NIC). Two arguments for this:
  * 1. Each NIC is essentially a synchronization point for all servers
@@ -314,6 +320,49 @@ static void nbd_end_request(struct request *req)
 	spin_unlock_irqrestore(q->queue_lock, flags);
 }
 
+#define SHUTDOWN_UNLOCK_TIMEOUT_SEC	20
+
+static void nbd_unlock_timeout(unsigned long arg)
+{
+	struct nbd_device *nbd = (struct nbd_device *)arg;
+
+	if ( mutex_is_locked(&nbd->tx_lock) ) {
+		printk(KERN_ERR "%s: nbd_unlock_timeout() UNLOCKING tx_lock after %d seconds!\n",
+					nbd->disk->disk_name, SHUTDOWN_UNLOCK_TIMEOUT_SEC );
+		mutex_unlock(&nbd->tx_lock);
+	}
+}
+
+static void
+lock_auto_unlockable_mutex(struct nbd_device *nbd, const char *funcname)
+{
+	struct timer_list uti;
+	int unlock_timer_enabled = 0;
+
+	/* if lock is already locked, WARN of the upcoming deadlock and
+	 * unlock it by force within SHUTDOWN_UNLOCK_TIMEOUT_SEC seconds! */
+	if ( mutex_is_locked(&nbd->tx_lock) ) {
+
+		printk(KERN_ERR "%s: %s() WARNING: LOCKED tx_lock, will auto unlock in %d sec!\n",
+				nbd->disk->disk_name, funcname, SHUTDOWN_UNLOCK_TIMEOUT_SEC );
+
+		init_timer(&uti);
+		uti.function = nbd_unlock_timeout;
+		uti.data = (unsigned long)nbd;
+		uti.expires = jiffies + (SHUTDOWN_UNLOCK_TIMEOUT_SEC * HZ);
+		add_timer(&uti);
+
+		unlock_timer_enabled = 1; /* timer enabled */
+	}
+
+	mutex_lock(&nbd->tx_lock); /* ok, now lock it... */
+
+	if ( unlock_timer_enabled ) { /* did we have to set the timer? if yes, then disable it! */
+
+		del_timer(&uti); /* this works in inactive timers too... */
+	}
+}
+
 static void sock_shutdown(struct nbd_device *nbd, int lock)
 {
 	/* Forcibly shutdown the socket causing all listeners
@@ -323,7 +372,7 @@ static void sock_shutdown(struct nbd_device *nbd, int lock)
 	 * there should be a more generic interface rather than
 	 * calling socket ops directly here */
 	if (lock)
-		mutex_lock(&nbd->tx_lock);
+		lock_auto_unlockable_mutex(nbd, "sock_shutdown");
 
 	if (nbd->sock) {
 #ifdef ENABLE_REQ_DEBUG
@@ -526,10 +575,8 @@ static int sock_xmit(struct nbd_device *nbd, int send, void *buf, int size,
 				dequeue_signal_lock(current, &current->blocked, &info),
 				mutex_is_locked(&nbd->tx_lock), send );
 			result = -EINTR;
-			sock_shutdown(nbd, !send && !mutex_is_locked(&nbd->tx_lock) );
-			// IMPORTANT: need the following unlock to unblock ioctls which have aquired it!
-			if ( !send && mutex_is_locked(&nbd->tx_lock) )
-				mutex_unlock(&nbd->tx_lock);
+			/* NOTE: sock_shutdown has auto-unlockable tx_lock (via timeout) */
+			sock_shutdown(nbd, !send);
 			printk(KERN_WARNING "%s: (pid %d: %s) socket shut down OK... lock: %d\n",
 				nbd->disk->disk_name, task_pid_nr(current), current->comm,
 				mutex_is_locked(&nbd->tx_lock) );
@@ -556,7 +603,8 @@ static inline int sock_send_bvec(struct nbd_device *nbd, struct bio_vec *bvec,
 {
 	int result;
 	void *kaddr = kmap(bvec->bv_page);
-	result = sock_xmit(nbd, 1, kaddr + bvec->bv_offset, bvec->bv_len, flags);
+	result = sock_xmit(nbd, 1, kaddr + bvec->bv_offset,
+			   bvec->bv_len, flags);
 	kunmap(bvec->bv_page);
 	return result;
 }
@@ -568,8 +616,10 @@ static int nbd_send_req(struct nbd_device *nbd, struct request *req)
 	struct nbd_request request;
 	unsigned long size = blk_rq_bytes(req);
 
+	memset(&request, 0, sizeof(request));
 	request.magic = htonl(NBD_REQUEST_MAGIC);
 	request.type = htonl(nbd_cmd(req));
+
 	request.from = cpu_to_be64((u64)blk_rq_pos(req) << 9);
 	request.len = htonl(size);
 	memcpy(request.handle, &req, sizeof(req));
@@ -580,8 +630,8 @@ static int nbd_send_req(struct nbd_device *nbd, struct request *req)
 			(unsigned long long)blk_rq_pos(req) << 9,
 			blk_rq_bytes(req));
 	if ( nbd_cmd(req) == NBD_CMD_WRITE ||
-		( req->cmd_type == REQ_TYPE_SPECIAL && nbd_cmd(req) == NBD_CMD_QHASH ) ||
-		( req->cmd_type == REQ_TYPE_SPECIAL && nbd_cmd(req) == NBD_CMD_QHASHB ) )
+		( req->cmd_type == DEP_REQ_TYPE_SPECIAL && nbd_cmd(req) == NBD_CMD_QHASH ) ||
+		( req->cmd_type == DEP_REQ_TYPE_SPECIAL && nbd_cmd(req) == NBD_CMD_QHASHB ) )
 		flags = MSG_MORE;
 #ifdef NBD_DEBUG_CMDS
 	assert( last_req_cnt >= 0 && last_req_cnt <= MAX_LAST_ITEMS );
@@ -638,7 +688,7 @@ static int nbd_send_req(struct nbd_device *nbd, struct request *req)
 		dprintk(DBG_TX, "%s: WRITE request %p: DONE - SENT: %d bytes [flags= %d]\n",
 						nbd->disk->disk_name, req, bcount, flags);
 
-	} else if ( req->cmd_type == REQ_TYPE_SPECIAL &&
+	} else if ( req->cmd_type == DEP_REQ_TYPE_SPECIAL &&
 			  ( nbd_cmd(req) == NBD_CMD_QHASH || nbd_cmd(req) == NBD_CMD_QHASHB ) ) {
 		/* special processing for qhash requests... */
 		nbd_query_blkhash_t * nbd_qhash = req->special;
@@ -675,7 +725,7 @@ static int nbd_send_req(struct nbd_device *nbd, struct request *req)
 			goto error_out;
 		}
 
-	} else if ( req->cmd_type == REQ_TYPE_SPECIAL && nbd_cmd(req) == NBD_CMD_SRVCMD ) {
+	} else if ( req->cmd_type == DEP_REQ_TYPE_SPECIAL && nbd_cmd(req) == NBD_CMD_SRVCMD ) {
 		/* special processing for srvcmd requests... */
 		nbd_server_cmd_t * nbd_srvcmd = req->special;
 
@@ -790,7 +840,7 @@ static struct request *nbd_read_stat(struct nbd_device *nbd)
 		dprintk(DBG_QHASH, "%s RESP: Checking for Query Hash reply! (%d pending reqs, qreq= %p)\n",
 						nbd->disk->disk_name, atomic_read(&nbd->qhash_pending), qreq );
 
-	   	if ( qreq->cmd_type == REQ_TYPE_SPECIAL && nbd_cmd(qreq) == NBD_CMD_QHASH) {
+	   	if ( qreq->cmd_type == DEP_REQ_TYPE_SPECIAL && nbd_cmd(qreq) == NBD_CMD_QHASH) {
 
 			/* NOTE: we don't recv the response directly into the ioctl buffer, because
 			 *       we will need to check & convert the values received... */
@@ -857,7 +907,7 @@ static struct request *nbd_read_stat(struct nbd_device *nbd)
 			dprintk(DBG_QHASH, "%s RESP: ===== EXIT == QHASH =============\n", nbd->disk->disk_name );
 			return qreq;
 
-		} else if ( qreq->cmd_type == REQ_TYPE_SPECIAL && nbd_cmd(qreq) == NBD_CMD_QHASHB ) {
+		} else if ( qreq->cmd_type == DEP_REQ_TYPE_SPECIAL && nbd_cmd(qreq) == NBD_CMD_QHASHB ) {
 
 			/* NOTE: we don't recv the response directly into the ioctl buffer, because
 			 *       we will need to check & convert the values received... */
@@ -934,7 +984,7 @@ static struct request *nbd_read_stat(struct nbd_device *nbd)
 		dprintk(DBG_IOCMDS, "%s RESP: Checking for Server CMD reply! (%d pending reqs, creq= %p)\n",
 						nbd->disk->disk_name, atomic_read(&nbd->srvcmd_pending), creq );
 
-	   	if ( creq->cmd_type == REQ_TYPE_SPECIAL && nbd_cmd(creq) == NBD_CMD_SRVCMD) {
+	   	if ( creq->cmd_type == DEP_REQ_TYPE_SPECIAL && nbd_cmd(creq) == NBD_CMD_SRVCMD) {
 
 			/* NOTE: we don't recv the response directly into the ioctl buffer, because
 			 *       we will need to check & convert the values received... */
@@ -994,7 +1044,7 @@ static struct request *nbd_read_stat(struct nbd_device *nbd)
 		}
 
 		/* Is this a FLUSH request? */
-		else if ( creq->cmd_type == REQ_TYPE_SPECIAL && nbd_cmd(creq) == NBD_CMD_FLUSH) {
+		else if ( creq->cmd_type == DEP_REQ_TYPE_SPECIAL && nbd_cmd(creq) == NBD_CMD_FLUSH) {
 
 			dprintk(DBG_IOCMDS, "%s RESP: Received FLUSH reply! (req %p)\n",
 							nbd->disk->disk_name, creq);
@@ -1131,7 +1181,7 @@ static int nbd_do_it(struct nbd_device *nbd)
 	}
 
 	while ((req = nbd_read_stat(nbd)) != NULL) {
-		if (req->cmd_type == REQ_TYPE_SPECIAL &&
+		if (req->cmd_type == DEP_REQ_TYPE_SPECIAL &&
 			( nbd_cmd(req) == NBD_CMD_QHASH || nbd_cmd(req) == NBD_CMD_SRVCMD ||
 			  nbd_cmd(req) == NBD_CMD_FLUSH || nbd_cmd(req) == NBD_CMD_QHASHB ) ) { /* qhash or srvcmd req? */
 			complete( (struct completion *)req->completion_data );
@@ -1214,7 +1264,7 @@ static void nbd_clear_que(struct nbd_device *nbd)
 
 		reset_req_response_deadline(nbd); /* reset response deadlines appropriately */
 
-		if (req->cmd_type == REQ_TYPE_SPECIAL ) {
+		if (req->cmd_type == DEP_REQ_TYPE_SPECIAL ) {
 			if ( nbd_cmd(req) == NBD_CMD_QHASH || nbd_cmd(req) == NBD_CMD_QHASHB ) { /* qhash req? */
 				complete( (struct completion *)req->completion_data );
 				atomic_dec( &nbd->qhash_pending );
@@ -1238,13 +1288,13 @@ static void nbd_clear_que(struct nbd_device *nbd)
 
 	while (!list_empty(&nbd->waiting_queue)) {
 		req = list_entry(nbd->waiting_queue.next, struct request,
-			queuelist);
+				 queuelist);
 		list_del_init(&req->queuelist);
 		req->errors++;
 
 		reset_req_response_deadline(nbd); /* reset response deadlines appropriately */
 
-		if (req->cmd_type == REQ_TYPE_SPECIAL ) {
+		if (req->cmd_type == DEP_REQ_TYPE_SPECIAL ) {
 			if ( nbd_cmd(req) == NBD_CMD_QHASH || nbd_cmd(req) == NBD_CMD_QHASHB ) { /* qhash req? */
 				complete( (struct completion *)req->completion_data );
 				atomic_dec( &nbd->qhash_pending );
@@ -1484,7 +1534,6 @@ static void do_nbd_request(struct request_queue *q)
 			}
 			req->errors++;
 			nbd_end_request(req);
-
 			spin_lock_irq(q->queue_lock);
 			disarm_response_timer( nbd );
 			continue;
@@ -1517,7 +1566,7 @@ static int __nbd_ioctl(struct block_device *bdev, struct nbd_device *nbd,
 		fsync_bdev(bdev);
 		mutex_lock(&nbd->tx_lock);
 		blk_rq_init(NULL, &sreq);
-		sreq.cmd_type = REQ_TYPE_SPECIAL;
+		sreq.cmd_type = DEP_REQ_TYPE_SPECIAL;
 		nbd_cmd(&sreq) = NBD_CMD_DISC;
 
 		/* Check again after getting mutex back.  */
@@ -1560,7 +1609,7 @@ static int __nbd_ioctl(struct block_device *bdev, struct nbd_device *nbd,
 
 		/* _____________________________________
 		 * setup the command request header... */
-		qreq->cmd_type = REQ_TYPE_SPECIAL;
+		qreq->cmd_type = DEP_REQ_TYPE_SPECIAL;
 		nbd_cmd(qreq) = NBD_CMD_QHASH;
 
 		/* NOTE: assuming a sector size= 512 bytes! */
@@ -1674,7 +1723,7 @@ qhash_exit:
 
 		/* _____________________________________
 		 * setup the command request header... */
-		qreq->cmd_type = REQ_TYPE_SPECIAL;
+		qreq->cmd_type = DEP_REQ_TYPE_SPECIAL;
 		nbd_cmd(qreq) = NBD_CMD_QHASHB;
 
 		/* NOTE: assuming a sector size= 512 bytes! */
@@ -1887,7 +1936,7 @@ cinfo_exit:
 
 			/* _____________________________________
 			 * setup the command request header... */
-			creq->cmd_type = REQ_TYPE_SPECIAL;
+			creq->cmd_type = DEP_REQ_TYPE_SPECIAL;
 			nbd_cmd(creq) = NBD_CMD_SRVCMD;
 
 			/* NOTE: assuming a sector size= 512 bytes! */
@@ -2082,6 +2131,10 @@ srvcmd_exit:
 		error = nbd_do_it(nbd);
 		kthread_stop(thread);
 
+		/* Michail, 16Aug2017: removed this message, as it's no longer useful, only fills the syslog... */
+		//if ( mutex_is_locked(&nbd->tx_lock) ) /* WARN of the upcoming deadlock! */
+		//	printk(KERN_ERR "%s: WARNING: LOCKED tx_lock! deadlock coming up?\n", nbd->disk->disk_name );
+
 		mutex_lock(&nbd->tx_lock);
 		printk(KERN_ERR "%s: EXITING: stopped kthread, got tx_lock...\n", nbd->disk->disk_name );
 		if (error)
@@ -2149,7 +2202,7 @@ srvcmd_exit:
 
 			/* _____________________________________
 			 * setup the command request header... */
-			creq->cmd_type = REQ_TYPE_SPECIAL;
+			creq->cmd_type = DEP_REQ_TYPE_SPECIAL;
 			nbd_cmd(creq) = NBD_CMD_FLUSH;
 
 			{	/* Debug block */
@@ -2234,7 +2287,17 @@ static int nbd_ioctl(struct block_device *bdev, fmode_t mode,
 	dprintk(DBG_IOCTL, "%s: nbd_ioctl cmd=%s(0x%x) arg=%lu\n",
 		nbd->disk->disk_name, ioctl_cmd_to_ascii(cmd), cmd, arg);
 
-	mutex_lock(&nbd->tx_lock);
+	switch (cmd) { /* on some cmds we auto-unlock... */
+	case NBD_DISCONNECT:
+	case NBD_CLEAR_SOCK:
+	case NBD_CLEAR_QUE:
+		lock_auto_unlockable_mutex(nbd, "nbd_ioctl");
+	break;
+	default:
+		mutex_lock(&nbd->tx_lock);
+	break;
+	}
+
 	error = __nbd_ioctl(bdev, nbd, cmd, arg);
 	mutex_unlock(&nbd->tx_lock);
 
